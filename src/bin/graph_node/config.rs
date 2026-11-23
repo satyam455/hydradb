@@ -7,7 +7,7 @@ use std::time::Duration;
 use hydradb::{
     BoltReadRouting, CypherEngineMode, GraphBackpressurePolicy, GraphCacheConfig, GraphCachePolicy, GraphDurabilityConfig, GraphId,
     GraphIndexPolicy, GraphLimits, GraphMemoryConfig, GraphOpenOptions, GraphScope, GraphStorageMemoryConfig, MutationAtomicityPolicy,
-    NamespacePath, PlannerStatisticsConfig, SparseKernelBackend,
+    NamespacePath, PlannerStatisticsConfig, SlateDbCacheEviction, SparseKernelBackend,
 };
 use hydradb_placement::NodeAddresses;
 
@@ -41,6 +41,16 @@ pub struct RuntimeConfig {
     pub data_cache_part_bytes: usize,
     pub data_cache_max_open_files: usize,
     pub slatedb_cache_bytes: usize,
+    /// `GRAPH_SLATE_DB_CACHE_EVICTION`: lru (default), fifo, s3fifo, sieve or lfu.
+    pub slatedb_cache_eviction: SlateDbCacheEviction,
+    /// `GRAPH_SST_BLOCK_BYTES`: SST block size for writers; unset keeps 4 KiB.
+    pub sst_block_bytes: Option<usize>,
+    /// `GRAPH_COMPACTION_RUNTIME_THREADS`: run the embedded compactor on its
+    /// own runtime with this many threads; unset keeps it on the query runtime.
+    pub compaction_runtime_threads: Option<usize>,
+    /// `GRAPH_MAX_PENDING_DURABLE_WRITES`: committed writes per shard that may
+    /// wait for WAL durability together (default 16).
+    pub max_pending_durable_writes: usize,
     pub slatedb_cache_observe: bool,
     pub slatedb_cache_observe_max_resident_records: usize,
     pub slatedb_cache_observe_max_ghost_records: usize,
@@ -253,6 +263,23 @@ impl RuntimeConfig {
                 GraphCacheConfig::default().object_store_cache_max_open_file_handles,
             )?,
             slatedb_cache_bytes: parse_usize_allow_zero(&values, "GRAPH_SLATE_DB_CACHE_BYTES", 640 * 1024 * 1024)?,
+            slatedb_cache_eviction: match optional_value(&values, "GRAPH_SLATE_DB_CACHE_EVICTION") {
+                Some(raw) => raw
+                    .parse::<SlateDbCacheEviction>()
+                    .map_err(|err| Error::new(ErrorKind::InvalidInput, format!("invalid GRAPH_SLATE_DB_CACHE_EVICTION: {err}")))?,
+                None => SlateDbCacheEviction::default(),
+            },
+            sst_block_bytes: optional_value(&values, "GRAPH_SST_BLOCK_BYTES")
+                .map(|_| parse_usize(&values, "GRAPH_SST_BLOCK_BYTES", 4096))
+                .transpose()?,
+            compaction_runtime_threads: optional_value(&values, "GRAPH_COMPACTION_RUNTIME_THREADS")
+                .map(|_| parse_usize(&values, "GRAPH_COMPACTION_RUNTIME_THREADS", 2))
+                .transpose()?,
+            max_pending_durable_writes: parse_usize(
+                &values,
+                "GRAPH_MAX_PENDING_DURABLE_WRITES",
+                hydradb::GraphBackpressurePolicy::default().max_pending_durable_writes,
+            )?,
             slatedb_cache_observe: parse_bool(&values, "GRAPH_SLATE_DB_CACHE_OBSERVE", false)?,
             slatedb_cache_observe_max_resident_records: parse_usize(&values, "GRAPH_SLATE_DB_CACHE_OBSERVE_MAX_RESIDENT_RECORDS", 65_536)?,
             slatedb_cache_observe_max_ghost_records: parse_usize(&values, "GRAPH_SLATE_DB_CACHE_OBSERVE_MAX_GHOST_RECORDS", 65_536)?,
@@ -389,6 +416,8 @@ impl RuntimeConfig {
         options.cache.object_store_cache_part_bytes = self.data_cache_part_bytes;
         options.cache.object_store_cache_max_open_file_handles = self.data_cache_max_open_files;
         options.cache.slatedb_cache_bytes = self.slatedb_cache_bytes;
+        options.cache.slatedb_cache_eviction = self.slatedb_cache_eviction;
+        options.backpressure_policy.max_pending_durable_writes = self.max_pending_durable_writes;
         options.cache.slatedb_cache_observe = self.slatedb_cache_observe;
         options.cache.slatedb_cache_observe_max_resident_records = self.slatedb_cache_observe_max_resident_records;
         options.cache.slatedb_cache_observe_max_ghost_records = self.slatedb_cache_observe_max_ghost_records;
@@ -422,6 +451,8 @@ impl RuntimeConfig {
                 max_unflushed_bytes: self.max_unflushed_bytes,
                 max_wal_flushes_before_l0_flush: self.max_wal_flushes_before_l0_flush,
                 l0_flush_parallelism: self.l0_flush_parallelism,
+                sst_block_bytes: self.sst_block_bytes,
+                compaction_runtime_threads: self.compaction_runtime_threads,
             },
             max_matrix_adjacency_bytes: self.max_matrix_adjacency_bytes,
             max_graphblas_bytes: self.max_graphblas_bytes,

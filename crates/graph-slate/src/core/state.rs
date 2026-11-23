@@ -681,7 +681,7 @@ impl SlateGraphStore {
             mutation: Arc::new(SlateMutationState {
                 graph_write_gate: Arc::new(Semaphore::new(graph_write_permit_capacity)),
                 graph_write_permit_capacity,
-                write_pipeline_gate: Arc::new(Semaphore::new(crate::write_pipeline::MAX_PENDING_DURABLE_WRITES)),
+                write_pipeline_gate: Arc::new(Semaphore::new(options.backpressure_policy.max_pending_durable_writes.max(1))),
                 index_policy: options.index_policy,
                 await_durable_writes: options.durability.await_durable_writes,
                 write_authority,

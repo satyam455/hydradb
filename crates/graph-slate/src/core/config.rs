@@ -156,6 +156,10 @@ pub struct GraphBackpressurePolicy {
     pub max_concurrent_graph_writes: usize,
     pub max_concurrent_artifact_builds: usize,
     pub max_concurrent_gc_jobs: usize,
+    /// Committed writes that may wait for WAL durability at once. Writes
+    /// waiting together share WAL uploads, so on object storage this bounds
+    /// per-shard durable-write throughput; zero is treated as one.
+    pub max_pending_durable_writes: usize,
 }
 
 impl Default for GraphBackpressurePolicy {
@@ -164,6 +168,7 @@ impl Default for GraphBackpressurePolicy {
             max_concurrent_graph_writes: 1,
             max_concurrent_artifact_builds: 1,
             max_concurrent_gc_jobs: 1,
+            max_pending_durable_writes: crate::write_pipeline::MAX_PENDING_DURABLE_WRITES,
         }
     }
 }
@@ -192,6 +197,51 @@ pub struct GraphCacheConfig {
     pub slatedb_cache_observe_max_ghost_records: usize,
     pub slatedb_cache_observe_max_metadata_bytes: usize,
     pub slatedb_cache_observe_ghost_retention_secs: u64,
+    /// Eviction policy of the process-wide SlateDB block cache. LRU is the
+    /// historical default; S3-FIFO, SIEVE and w-TinyLFU resist being flushed
+    /// by one-off scans such as a wide traversal fan-out.
+    pub slatedb_cache_eviction: SlateDbCacheEviction,
+}
+
+/// Eviction policies of the SlateDB block cache (all provided by Foyer).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SlateDbCacheEviction {
+    #[default]
+    Lru,
+    Fifo,
+    S3Fifo,
+    Sieve,
+    /// Foyer's w-TinyLFU.
+    Lfu,
+}
+
+impl SlateDbCacheEviction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lru => "lru",
+            Self::Fifo => "fifo",
+            Self::S3Fifo => "s3fifo",
+            Self::Sieve => "sieve",
+            Self::Lfu => "lfu",
+        }
+    }
+}
+
+impl std::str::FromStr for SlateDbCacheEviction {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+            "lru" => Ok(Self::Lru),
+            "fifo" => Ok(Self::Fifo),
+            "s3fifo" => Ok(Self::S3Fifo),
+            "sieve" => Ok(Self::Sieve),
+            "lfu" | "tinylfu" | "wtinylfu" => Ok(Self::Lfu),
+            other => Err(format!(
+                "unknown SlateDB cache eviction policy {other:?}; expected lru, fifo, s3fifo, sieve or lfu"
+            )),
+        }
+    }
 }
 
 impl Default for GraphCacheConfig {
@@ -209,6 +259,7 @@ impl Default for GraphCacheConfig {
             slatedb_cache_observe_max_ghost_records: 65_536,
             slatedb_cache_observe_max_metadata_bytes: 16 * 1024 * 1024,
             slatedb_cache_observe_ghost_retention_secs: 3600,
+            slatedb_cache_eviction: SlateDbCacheEviction::default(),
         }
     }
 }
@@ -230,6 +281,7 @@ impl GraphCacheConfig {
         crate::SharedSlateDbCacheConfig {
             capacity_bytes: self.slatedb_cache_bytes,
             observe,
+            eviction: self.slatedb_cache_eviction,
         }
     }
 
@@ -474,6 +526,14 @@ pub struct GraphStorageMemoryConfig {
     pub max_unflushed_bytes: usize,
     pub max_wal_flushes_before_l0_flush: u64,
     pub l0_flush_parallelism: usize,
+    /// SST data block size for graph writers. `None` keeps SlateDB's default
+    /// (4 KiB). Larger blocks mean fewer index entries and fewer requests per
+    /// range read, at the cost of more bytes per point read.
+    pub sst_block_bytes: Option<usize>,
+    /// Worker threads of a dedicated, process-wide runtime for the embedded
+    /// compactor. `None` keeps compaction on the runtime that opens the
+    /// writer, which is also the one serving queries.
+    pub compaction_runtime_threads: Option<usize>,
 }
 
 impl Default for GraphStorageMemoryConfig {
@@ -483,6 +543,8 @@ impl Default for GraphStorageMemoryConfig {
             max_unflushed_bytes: 64 * 1024 * 1024,
             max_wal_flushes_before_l0_flush: Self::DEFAULT_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH,
             l0_flush_parallelism: 1,
+            sst_block_bytes: None,
+            compaction_runtime_threads: None,
         }
     }
 }
@@ -535,7 +597,37 @@ impl GraphStorageMemoryConfig {
                 reason: "L0 flush parallelism must be greater than zero".to_string(),
             });
         }
+        self.sst_block_size()?;
+        if self.compaction_runtime_threads == Some(0) {
+            return Err(crate::GraphError::CorruptValue {
+                key: "storage_memory/compaction_runtime_threads".to_string(),
+                reason: "a dedicated compaction runtime needs at least one thread".to_string(),
+            });
+        }
         Ok(())
+    }
+
+    /// The configured SST block size as SlateDB's enum, if one is set.
+    pub fn sst_block_size(&self) -> Result<Option<slatedb::SstBlockSize>> {
+        use slatedb::SstBlockSize as B;
+        let Some(bytes) = self.sst_block_bytes else {
+            return Ok(None);
+        };
+        Ok(Some(match bytes {
+            1024 => B::Block1Kib,
+            2048 => B::Block2Kib,
+            4096 => B::Block4Kib,
+            8192 => B::Block8Kib,
+            16384 => B::Block16Kib,
+            32768 => B::Block32Kib,
+            65536 => B::Block64Kib,
+            other => {
+                return Err(crate::GraphError::CorruptValue {
+                    key: "storage_memory/sst_block_bytes".to_string(),
+                    reason: format!("SST block size {other} must be 1, 2, 4, 8, 16, 32 or 64 KiB"),
+                })
+            }
+        }))
     }
 
     fn apply_to_settings(&self, settings: &mut Settings) -> Result<()> {
@@ -624,6 +716,33 @@ fn graph_writer_settings(
     Ok(settings)
 }
 
+/// One multi-threaded runtime per process for embedded compactors, created
+/// on first use and never dropped (a runtime may not be dropped from async
+/// context, and writers can be opened and closed for the life of the process).
+/// The thread count of the first caller wins.
+fn dedicated_compaction_runtime(threads: usize) -> Result<tokio::runtime::Handle> {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime.handle().clone());
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(threads.max(1))
+        .thread_name("slatedb-compactor")
+        .enable_all()
+        .build()
+        .map_err(|error| crate::GraphError::CorruptValue {
+            key: "storage_memory/compaction_runtime_threads".to_string(),
+            reason: format!("cannot start the compaction runtime: {error}"),
+        })?;
+    // A racing caller may have won; its runtime is kept and ours is leaked
+    // rather than dropped here, which could be inside an async context.
+    match RUNTIME.set(runtime) {
+        Ok(()) => {}
+        Err(runtime) => std::mem::forget(runtime),
+    }
+    Ok(RUNTIME.get().expect("set above").handle().clone())
+}
+
 pub(crate) async fn open_graph_db(
     path: impl Into<Path>,
     object_store: Arc<dyn ObjectStore>,
@@ -632,15 +751,35 @@ pub(crate) async fn open_graph_db(
     durability: &GraphDurabilityConfig,
     db_cache: Arc<dyn slatedb::db_cache::DbCache>,
 ) -> Result<(Db, Arc<DefaultMetricsRecorder>)> {
-    let settings = graph_writer_settings(cache, storage_memory, durability)?;
+    let mut settings = graph_writer_settings(cache, storage_memory, durability)?;
+    let path: Path = path.into();
     // SlateDB registers its internal counters/gauges (L0 SST count, bloom
     // filter hits, request counts) through whatever recorder it is handed.
     // Without one it uses a no-op recorder and those numbers never leave the
     // process. We keep the handle so `SlateGraphStore::storage_metrics` can snapshot
     // them for `/metrics`.
     let recorder = Arc::new(DefaultMetricsRecorder::new());
-    let db = Db::builder(path, object_store)
-        .with_settings(settings)
+    let compactor = match (storage_memory.compaction_runtime_threads, settings.compactor_options.take()) {
+        // The same compactor SlateDB would build from the settings, moved onto
+        // its own threads so compaction cannot starve query tasks.
+        (Some(threads), Some(options)) => Some(
+            slatedb::CompactorBuilder::new(path.clone(), Arc::clone(&object_store))
+                .with_options(options)
+                .with_runtime(dedicated_compaction_runtime(threads)?),
+        ),
+        (_, options) => {
+            settings.compactor_options = options;
+            None
+        }
+    };
+    let mut builder = Db::builder(path, object_store).with_settings(settings);
+    if let Some(compactor) = compactor {
+        builder = builder.with_compactor_builder(compactor);
+    }
+    if let Some(block_size) = storage_memory.sst_block_size()? {
+        builder = builder.with_sst_block_size(block_size);
+    }
+    let db = builder
         .with_deferred_compactor_startup(true)
         .with_filter_policies(crate::prefix_filter::graph_filter_policies())
         .with_db_cache(db_cache, crate::core::db_cache::next_db_cache_id())

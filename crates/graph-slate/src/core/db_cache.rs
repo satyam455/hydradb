@@ -17,6 +17,7 @@ use crate::{GraphError, Result};
 pub struct SharedSlateDbCacheConfig {
     pub capacity_bytes: usize,
     pub observe: Option<ObserveConfig>,
+    pub eviction: crate::SlateDbCacheEviction,
 }
 
 impl SharedSlateDbCacheConfig {
@@ -24,6 +25,7 @@ impl SharedSlateDbCacheConfig {
         Self {
             capacity_bytes,
             observe: None,
+            eviction: crate::SlateDbCacheEviction::default(),
         }
     }
 
@@ -31,6 +33,7 @@ impl SharedSlateDbCacheConfig {
         Self {
             capacity_bytes,
             observe: Some(observe),
+            eviction: crate::SlateDbCacheEviction::default(),
         }
     }
 }
@@ -126,6 +129,17 @@ struct Observation {
     owner: ScopeHandle,
 }
 
+fn eviction_config(eviction: crate::SlateDbCacheEviction) -> foyer::EvictionConfig {
+    use crate::SlateDbCacheEviction as E;
+    match eviction {
+        E::Lru => foyer::LruConfig::default().into(),
+        E::Fifo => foyer::FifoConfig::default().into(),
+        E::S3Fifo => foyer::S3FifoConfig::default().into(),
+        E::Sieve => foyer::SieveConfig.into(),
+        E::Lfu => foyer::LfuConfig::default().into(),
+    }
+}
+
 /// Scoped handles share one physical process cache. Only observed caches wrap
 /// stored values; disabled observation keeps the original payload and loader path.
 pub struct SharedSlateDbCache {
@@ -198,6 +212,7 @@ impl SharedSlateDbCache {
         } else if let Some(observer) = observer {
             CacheBackend::Observed(
                 foyer::CacheBuilder::new(config.capacity_bytes)
+                    .with_eviction_config(eviction_config(config.eviction))
                     .with_weighter(|_, entry: &ObservedEntry| entry.value.size())
                     .with_event_listener(Arc::new(ObserverListener { observer }))
                     .build(),
@@ -205,6 +220,7 @@ impl SharedSlateDbCache {
         } else {
             CacheBackend::Plain(
                 foyer::CacheBuilder::new(config.capacity_bytes)
+                    .with_eviction_config(eviction_config(config.eviction))
                     .with_weighter(|_, value: &CachedEntry| value.size())
                     .build(),
             )

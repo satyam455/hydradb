@@ -10,6 +10,7 @@ use std::sync::{atomic::Ordering, Arc};
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::Instrument as _;
 
+/// Default for `GraphBackpressurePolicy::max_pending_durable_writes`.
 pub const MAX_PENDING_DURABLE_WRITES: usize = 16;
 
 tokio::task_local! {

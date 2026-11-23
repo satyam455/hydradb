@@ -52,8 +52,8 @@ pub use core::cache_observe::{
 };
 pub use core::config::{
     GraphBackpressurePolicy, GraphCacheConfig, GraphDurabilityConfig, GraphIndexPolicy, GraphLimits, GraphMemoryConfig, GraphOpenOptions,
-    GraphReaderMode, GraphStorageMemoryConfig, PlannerStatisticsConfig, DEFAULT_TRUSTED_APPEND_CHUNK_EDGES, GRAPH_SST_COMPRESSION_CODEC,
-    GRAPH_SST_TARGET_BYTES,
+    GraphReaderMode, GraphStorageMemoryConfig, PlannerStatisticsConfig, SlateDbCacheEviction, DEFAULT_TRUSTED_APPEND_CHUNK_EDGES,
+    GRAPH_SST_COMPRESSION_CODEC, GRAPH_SST_TARGET_BYTES,
 };
 pub use core::db_cache::SlateDbCacheMetricsSnapshot;
 #[cfg(feature = "query-transport")]
