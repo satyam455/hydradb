@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hydradb::{
-    local_object_store, object_store_from_env, GraphCacheConfig, GraphCachePolicy, GraphIndexPolicy, GraphLimits, GraphMemoryConfig,
-    GraphOpenOptions, GraphShard, GraphStorageMemoryConfig, QueryContext, QueryRow, QueryValue, RowQueryPlan, VertexId, VertexMetadata,
-    VertexPropertyValue,
+    local_object_store, object_store_from_env, CypherEngineMode, GraphCacheConfig, GraphCachePolicy, GraphIndexPolicy, GraphLimits,
+    GraphMemoryConfig, GraphOpenOptions, GraphOperationalMetricsSnapshot, GraphShard, GraphStorageMemoryConfig, QueryContext, QueryRow,
+    QueryValue, RowQueryPlan, VertexId, VertexMetadata, VertexPropertyValue,
 };
 use slatedb::object_store::ObjectStore;
 
@@ -155,7 +155,7 @@ async fn async_main() -> BenchResult<()> {
         cache_root.display()
     );
     println!(
-        "kind,object_backend,fanout,hops,edges,query_shape,page_size,build_ms,build_rss_mib,cold_samples,cold_open_query_p50_us,cold_open_query_p95_us,cold_open_query_p99_us,cold_open_query_mean_us,cold_query_p50_us,cold_query_p95_us,cold_query_p99_us,cold_query_mean_us,cold_peak_rss_mib,warm_us,warm_rss_mib,hot_p50_us,hot_p95_us,hot_p99_us,hot_mean_us,hot_qps,hot_peak_rss_mib,concurrency,concurrent_queries,concurrent_p50_us,concurrent_p95_us,concurrent_p99_us,concurrent_mean_us,concurrent_qps,concurrent_peak_rss_mib,rows,concurrent_rows,has_next,cold_cache_hydrations,warm_cache_hits,warm_cache_misses,property_fetches,property_fetch_us,optimizer_plan"
+        "kind,object_backend,fanout,hops,edges,query_shape,page_size,build_ms,build_rss_mib,cold_samples,cold_open_query_p50_us,cold_open_query_p95_us,cold_open_query_p99_us,cold_open_query_mean_us,cold_query_p50_us,cold_query_p95_us,cold_query_p99_us,cold_query_mean_us,cold_peak_rss_mib,warm_us,warm_rss_mib,hot_p50_us,hot_p95_us,hot_p99_us,hot_mean_us,hot_qps,hot_peak_rss_mib,concurrency,concurrent_queries,concurrent_p50_us,concurrent_p95_us,concurrent_p99_us,concurrent_mean_us,concurrent_qps,concurrent_peak_rss_mib,concurrent_peak_allocator_live_mib,concurrent_peak_allocator_free_mib,concurrent_peak_tracked_stage_mib,concurrent_graph_cache_mib,concurrent_slatedb_cache_mib,rows,concurrent_rows,has_next,cold_cache_hydrations,warm_cache_hits,warm_cache_misses,property_fetches,property_fetch_us,optimizer_plan"
     );
     io::stdout().flush()?;
 
@@ -368,7 +368,7 @@ async fn explain_plan(env: &BenchEnv, query: &str, name: &str) -> BenchResult<St
     )
     .await?;
     let plan = reader
-        .explain_opencypher_rows(QueryContext::new(CELL_ID, format!("explain-{name}")), query)
+        .explain_opencypher_rows(bench_query_context(format!("explain-{name}")), query)
         .await?;
     reader.close().await?;
     Ok(plan_signature(&plan))
@@ -387,7 +387,7 @@ async fn bench_rows_workload(env: &BenchEnv, run_config: &RunConfig, hop: u8, qu
     )
     .await?;
     let seed_rows = seed_reader
-        .execute_cypher_rows(QueryContext::new(CELL_ID, format!("warm-seed-rows-{}-{hop}", env.fanout)), query)
+        .execute_cypher_rows(bench_query_context(format!("warm-seed-rows-{}-{hop}", env.fanout)), query)
         .await?;
     assert_exact_rows(env.fanout, query, &seed_rows.rows, None);
     assert_eq!(cold.rows, seed_rows.rows.len());
@@ -402,11 +402,13 @@ async fn bench_rows_workload(env: &BenchEnv, run_config: &RunConfig, hop: u8, qu
         )
         .await?,
     );
+    let warm_before = warm_reader.graph_operational_metrics();
     let warm_started = Instant::now();
     let warm_rows = warm_reader
-        .execute_cypher_rows(QueryContext::new(CELL_ID, format!("warm-rows-{}-{hop}", env.fanout)), query)
+        .execute_cypher_rows(bench_query_context(format!("warm-rows-{}-{hop}", env.fanout)), query)
         .await?;
     let warm_elapsed = warm_started.elapsed();
+    log_experimental_delta("warm_rows", 1, &warm_before, &warm_reader.graph_operational_metrics());
     let warm_rss_bytes = current_rss_bytes();
     assert_exact_rows(env.fanout, query, &warm_rows.rows, None);
     assert_eq!(cold.rows, warm_rows.rows.len());
@@ -414,13 +416,14 @@ async fn bench_rows_workload(env: &BenchEnv, run_config: &RunConfig, hop: u8, qu
     let mut hot_latencies = Vec::with_capacity(run_config.hot_iters as usize);
     let fetches_before = property_fetch_totals(&warm_reader);
     let storage_before = warm_reader.graph_storage_metrics();
+    let operational_before = warm_reader.graph_operational_metrics();
     let hot_started = Instant::now();
     let mut rows = warm_rows.rows.len();
     let mut hot_peak_rss_bytes = warm_rss_bytes;
     for iter in 0..run_config.hot_iters {
         let started = Instant::now();
         let result = warm_reader
-            .execute_cypher_rows(QueryContext::new(CELL_ID, format!("hot-rows-{}-{hop}-{iter}", env.fanout)), query)
+            .execute_cypher_rows(bench_query_context(format!("hot-rows-{}-{hop}-{iter}", env.fanout)), query)
             .await?;
         rows = result.rows.len();
         hot_latencies.push(started.elapsed());
@@ -431,6 +434,12 @@ async fn bench_rows_workload(env: &BenchEnv, run_config: &RunConfig, hop: u8, qu
     let hot_stats = LatencyStats::from_durations(&hot_latencies);
     let (property_fetches, property_fetch_us) = property_fetch_delta(fetches_before, &warm_reader, run_config.hot_iters);
     log_storage_delta(query, run_config.hot_iters, &storage_before, &warm_reader.graph_storage_metrics());
+    log_experimental_delta(
+        "hot_rows",
+        run_config.hot_iters,
+        &operational_before,
+        &warm_reader.graph_operational_metrics(),
+    );
 
     let concurrent = bench_concurrent_rows(
         Arc::clone(&warm_reader),
@@ -506,6 +515,62 @@ fn log_storage_delta(
     );
 }
 
+fn bench_query_context(key: String) -> QueryContext {
+    let engine = match string_env("GRAPH_QUERY_BENCH_ENGINE", "legacy").to_ascii_lowercase().as_str() {
+        "legacy" => CypherEngineMode::Legacy,
+        "experimental" => CypherEngineMode::Experimental,
+        other => panic!("unsupported GRAPH_QUERY_BENCH_ENGINE={other}"),
+    };
+    QueryContext::new(CELL_ID, key).with_cypher_engine(engine)
+}
+
+fn log_experimental_delta(phase: &str, samples: u32, before: &GraphOperationalMetricsSnapshot, after: &GraphOperationalMetricsSnapshot) {
+    let requests = after.query_experimental_requests.saturating_sub(before.query_experimental_requests);
+    if requests == 0 {
+        return;
+    }
+    let denominator = f64::from(samples.max(1));
+    let per_sample = |after: u64, before: u64| after.saturating_sub(before) as f64 / denominator;
+    let execute_us = per_sample(after.query_experimental_execute_us, before.query_experimental_execute_us);
+    let storage_us = per_sample(after.query_experimental_storage_us, before.query_experimental_storage_us);
+    eprintln!(
+        "experimental_stage phase={phase} samples={samples} requests={requests} parse_us={:.3} lower_us={:.3} bind_us={:.3} snapshot_us={:.3} statistics_us={:.3} plan_us={:.3} execute_us={execute_us:.3} storage_us={storage_us:.3} operator_cpu_us={:.3} storage_calls={:.3} result_us={:.3}",
+        per_sample(after.query_experimental_parse_us, before.query_experimental_parse_us),
+        per_sample(after.query_experimental_lower_us, before.query_experimental_lower_us),
+        per_sample(after.query_experimental_bind_us, before.query_experimental_bind_us),
+        per_sample(after.query_experimental_snapshot_us, before.query_experimental_snapshot_us),
+        per_sample(
+            after.query_experimental_statistics_us,
+            before.query_experimental_statistics_us,
+        ),
+        per_sample(after.query_experimental_plan_us, before.query_experimental_plan_us),
+        (execute_us - storage_us).max(0.0),
+        per_sample(
+            after.query_experimental_storage_calls,
+            before.query_experimental_storage_calls,
+        ),
+        per_sample(after.query_experimental_result_us, before.query_experimental_result_us),
+    );
+    for operator in &after.experimental_operators {
+        let previous = before.experimental_operators.iter().find(|item| item.operator == operator.operator);
+        let old = |field: fn(&hydradb::ExperimentalOperatorMetricsSnapshot) -> u64| previous.map(field).unwrap_or(0);
+        let calls = operator.requests.saturating_sub(old(|item| item.requests));
+        if calls == 0 {
+            continue;
+        }
+        let self_us = operator.self_us.saturating_sub(old(|item| item.self_us));
+        let storage_us = operator.storage_us.saturating_sub(old(|item| item.storage_us));
+        eprintln!(
+            "experimental_operator phase={phase} name={} requests={calls} self_us_per_query={:.3} cpu_us_per_query={:.3} storage_us_per_query={:.3} storage_calls_per_query={:.3}",
+            operator.operator,
+            self_us as f64 / denominator,
+            self_us.saturating_sub(storage_us) as f64 / denominator,
+            storage_us as f64 / denominator,
+            operator.storage_requests.saturating_sub(old(|item| item.storage_requests)) as f64 / denominator,
+        );
+    }
+}
+
 async fn bench_page_workload(env: &BenchEnv, run_config: &RunConfig, workload_name: &str, query: &str) -> BenchResult<QueryBenchResult> {
     let cold = bench_cold_page(env, run_config, workload_name, query).await?;
 
@@ -520,7 +585,7 @@ async fn bench_page_workload(env: &BenchEnv, run_config: &RunConfig, workload_na
     .await?;
     let seed_page = seed_reader
         .execute_cypher_rows_page(
-            QueryContext::new(CELL_ID, format!("warm-seed-page-{}-{workload_name}", env.fanout)),
+            bench_query_context(format!("warm-seed-page-{}-{workload_name}", env.fanout)),
             query,
             None,
             run_config.page_size,
@@ -540,16 +605,18 @@ async fn bench_page_workload(env: &BenchEnv, run_config: &RunConfig, workload_na
         )
         .await?,
     );
+    let warm_before = warm_reader.graph_operational_metrics();
     let warm_started = Instant::now();
     let warm_page = warm_reader
         .execute_cypher_rows_page(
-            QueryContext::new(CELL_ID, format!("warm-page-{}", env.fanout)),
+            bench_query_context(format!("warm-page-{}", env.fanout)),
             query,
             None,
             run_config.page_size,
         )
         .await?;
     let warm_elapsed = warm_started.elapsed();
+    log_experimental_delta("warm_page", 1, &warm_before, &warm_reader.graph_operational_metrics());
     let warm_rss_bytes = current_rss_bytes();
     assert_exact_rows(env.fanout, query, &warm_page.rows, Some(run_config.page_size));
     assert_eq!(cold.rows, warm_page.rows.len());
@@ -558,6 +625,7 @@ async fn bench_page_workload(env: &BenchEnv, run_config: &RunConfig, workload_na
     let mut hot_latencies = Vec::with_capacity(run_config.hot_iters as usize);
     let fetches_before = property_fetch_totals(&warm_reader);
     let storage_before = warm_reader.graph_storage_metrics();
+    let operational_before = warm_reader.graph_operational_metrics();
     let hot_started = Instant::now();
     let mut rows = warm_page.rows.len();
     let mut has_next = warm_page.next_cursor.is_some();
@@ -566,7 +634,7 @@ async fn bench_page_workload(env: &BenchEnv, run_config: &RunConfig, workload_na
         let started = Instant::now();
         let page = warm_reader
             .execute_cypher_rows_page(
-                QueryContext::new(CELL_ID, format!("hot-page-{}-{iter}", env.fanout)),
+                bench_query_context(format!("hot-page-{}-{iter}", env.fanout)),
                 query,
                 None,
                 run_config.page_size,
@@ -582,6 +650,12 @@ async fn bench_page_workload(env: &BenchEnv, run_config: &RunConfig, workload_na
     let hot_stats = LatencyStats::from_durations(&hot_latencies);
     let (property_fetches, property_fetch_us) = property_fetch_delta(fetches_before, &warm_reader, run_config.hot_iters);
     log_storage_delta(query, run_config.hot_iters, &storage_before, &warm_reader.graph_storage_metrics());
+    log_experimental_delta(
+        "hot_page",
+        run_config.hot_iters,
+        &operational_before,
+        &warm_reader.graph_operational_metrics(),
+    );
 
     let concurrent = bench_concurrent_pages(
         Arc::clone(&warm_reader),
@@ -636,14 +710,13 @@ async fn bench_cold_rows(env: &BenchEnv, run_config: &RunConfig, hop: u8, query:
         )
         .await?;
 
+        let operational_before = reader.graph_operational_metrics();
         let query_started = Instant::now();
         let result = reader
-            .execute_cypher_rows(
-                QueryContext::new(CELL_ID, format!("cold-rows-{}-{hop}-{sample}", env.fanout)),
-                query,
-            )
+            .execute_cypher_rows(bench_query_context(format!("cold-rows-{}-{hop}-{sample}", env.fanout)), query)
             .await?;
         query_latencies.push(query_started.elapsed());
+        log_experimental_delta("cold_rows", 1, &operational_before, &reader.graph_operational_metrics());
         open_query_latencies.push(open_started.elapsed());
         assert_exact_rows(env.fanout, query, &result.rows, None);
 
@@ -691,16 +764,18 @@ async fn bench_cold_page(env: &BenchEnv, run_config: &RunConfig, workload_name: 
         )
         .await?;
 
+        let operational_before = reader.graph_operational_metrics();
         let query_started = Instant::now();
         let page = reader
             .execute_cypher_rows_page(
-                QueryContext::new(CELL_ID, format!("cold-page-{}-{workload_name}-{sample}", env.fanout)),
+                bench_query_context(format!("cold-page-{}-{workload_name}-{sample}", env.fanout)),
                 query,
                 None,
                 run_config.page_size,
             )
             .await?;
         query_latencies.push(query_started.elapsed());
+        log_experimental_delta("cold_page", 1, &operational_before, &reader.graph_operational_metrics());
         open_query_latencies.push(open_started.elapsed());
         assert_exact_rows(env.fanout, query, &page.rows, Some(run_config.page_size));
 
@@ -740,7 +815,9 @@ async fn bench_concurrent_rows(
     concurrency: usize,
     iters_per_worker: u32,
 ) -> BenchResult<ConcurrentStats> {
+    let (stop_sampler, sampler) = start_memory_sampler();
     let total_started = Instant::now();
+    let idle_workers = std::env::var("GRAPH_QUERY_BENCH_IDLE_WORKERS").is_ok_and(|v| v == "1");
     let mut tasks = Vec::with_capacity(concurrency);
     for worker in 0..concurrency {
         let shard = Arc::clone(&shard);
@@ -749,10 +826,14 @@ async fn bench_concurrent_rows(
             let mut latencies = Vec::with_capacity(iters_per_worker as usize);
             let mut rows = 0_usize;
             for iter in 0..iters_per_worker {
+                if idle_workers {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
                 let started = Instant::now();
                 let result = shard
                     .execute_cypher_rows(
-                        QueryContext::new(CELL_ID, format!("concurrent-rows-{fanout}-{hop}-{worker}-{iter}")),
+                        bench_query_context(format!("concurrent-rows-{fanout}-{hop}-{worker}-{iter}")),
                         &query,
                     )
                     .await?;
@@ -771,13 +852,18 @@ async fn bench_concurrent_rows(
         latencies.append(&mut task_latencies);
     }
     let elapsed = total_started.elapsed();
-    let peak_rss_bytes = current_rss_bytes();
+    let _ = stop_sampler.send(true);
+    let memory = sampler.await?;
+    let graph_cache_resident_bytes = shard.graph_cache_resident_bytes().await.total() as u64;
+    let slatedb_cache_resident_bytes = shard.slatedb_cache_metrics().resident_bytes;
     Ok(ConcurrentStats {
         stats: LatencyStats::from_durations(&latencies),
         qps: (latencies.len() as f64) / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
         queries: latencies.len() as u64,
         rows,
-        peak_rss_bytes,
+        memory,
+        graph_cache_resident_bytes,
+        slatedb_cache_resident_bytes,
     })
 }
 
@@ -789,6 +875,7 @@ async fn bench_concurrent_pages(
     concurrency: usize,
     iters_per_worker: u32,
 ) -> BenchResult<ConcurrentStats> {
+    let (stop_sampler, sampler) = start_memory_sampler();
     let total_started = Instant::now();
     let mut tasks = Vec::with_capacity(concurrency);
     for worker in 0..concurrency {
@@ -801,7 +888,7 @@ async fn bench_concurrent_pages(
                 let started = Instant::now();
                 let page = shard
                     .execute_cypher_rows_page(
-                        QueryContext::new(CELL_ID, format!("concurrent-page-{fanout}-{worker}-{iter}")),
+                        bench_query_context(format!("concurrent-page-{fanout}-{worker}-{iter}")),
                         &query,
                         None,
                         page_size,
@@ -822,13 +909,18 @@ async fn bench_concurrent_pages(
         latencies.append(&mut task_latencies);
     }
     let elapsed = total_started.elapsed();
-    let peak_rss_bytes = current_rss_bytes();
+    let _ = stop_sampler.send(true);
+    let memory = sampler.await?;
+    let graph_cache_resident_bytes = shard.graph_cache_resident_bytes().await.total() as u64;
+    let slatedb_cache_resident_bytes = shard.slatedb_cache_metrics().resident_bytes;
     Ok(ConcurrentStats {
         stats: LatencyStats::from_durations(&latencies),
         qps: (latencies.len() as f64) / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
         queries: latencies.len() as u64,
         rows,
-        peak_rss_bytes,
+        memory,
+        graph_cache_resident_bytes,
+        slatedb_cache_resident_bytes,
     })
 }
 
@@ -845,6 +937,17 @@ fn graph_options(
     let max_graphblas_matrices = env_usize("GRAPH_QUERY_BENCH_MAX_GRAPHBLAS_MATRICES", 1);
     {
         let options = GraphOpenOptions::default();
+        let mut cache = cache_dir
+            .filter(|_| cache_bytes > 0)
+            .map(|path| GraphCacheConfig::disk_cache_without_preload(path, cache_bytes))
+            .unwrap_or_else(GraphCacheConfig::disabled);
+        cache.slatedb_cache_bytes = env_usize(
+            "GRAPH_QUERY_BENCH_SLATE_DB_CACHE_BYTES",
+            GraphCacheConfig::default().slatedb_cache_bytes,
+        );
+        if let Ok(raw) = std::env::var("GRAPH_QUERY_BENCH_SLATE_DB_CACHE_EVICTION") {
+            cache.slatedb_cache_eviction = raw.parse().expect("GRAPH_QUERY_BENCH_SLATE_DB_CACHE_EVICTION");
+        }
         GraphOpenOptions {
             limits: GraphLimits {
                 max_bulk_import_edges: usize::try_from(edges).unwrap_or(usize::MAX).max(1),
@@ -858,10 +961,7 @@ fn graph_options(
                 max_query_runtime_ms: Some(env_u64("GRAPH_QUERY_BENCH_QUERY_TIMEOUT_MS", 120_000)),
                 ..GraphLimits::default()
             },
-            cache: cache_dir
-                .filter(|_| cache_bytes > 0)
-                .map(|path| GraphCacheConfig::disk_cache_without_preload(path, cache_bytes))
-                .unwrap_or_else(GraphCacheConfig::disabled),
+            cache,
             cache_policy: {
                 let cache_policy = GraphCachePolicy::default();
                 GraphCachePolicy {
@@ -890,6 +990,12 @@ fn graph_memory_config() -> GraphMemoryConfig {
                 "GRAPH_QUERY_BENCH_MAX_UNFLUSHED_BYTES",
                 GraphStorageMemoryConfig::default().max_unflushed_bytes,
             ),
+            sst_block_bytes: std::env::var("GRAPH_QUERY_BENCH_SST_BLOCK_BYTES")
+                .ok()
+                .map(|raw| raw.parse().expect("GRAPH_QUERY_BENCH_SST_BLOCK_BYTES")),
+            compaction_runtime_threads: std::env::var("GRAPH_QUERY_BENCH_COMPACTION_RUNTIME_THREADS")
+                .ok()
+                .map(|raw| raw.parse().expect("GRAPH_QUERY_BENCH_COMPACTION_RUNTIME_THREADS")),
             ..GraphStorageMemoryConfig::default()
         },
         ..GraphMemoryConfig::default()
@@ -899,7 +1005,7 @@ fn graph_memory_config() -> GraphMemoryConfig {
 fn print_result(record: PrintRecord<'_>) -> BenchResult<()> {
     let result = record.result;
     println!(
-        "{},{},{},{},{},{},{},{},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.2},{:.3},{},{},{},{},{},{},{:.3},{:.3},{}",
+        "{},{},{},{},{},{},{},{},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.3},{},{},{:.3},{:.3},{:.3},{:.3},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{},{},{:.3},{:.3},{}",
         record.kind,
         record.object_backend,
         record.fanout,
@@ -934,7 +1040,12 @@ fn print_result(record: PrintRecord<'_>) -> BenchResult<()> {
         result.concurrent.stats.p99_us,
         result.concurrent.stats.mean_us,
         result.concurrent.qps,
-        bytes_to_mib(result.concurrent.peak_rss_bytes),
+        bytes_to_mib(result.concurrent.memory.peak_rss_bytes),
+        bytes_to_mib(result.concurrent.memory.peak_allocator_live_bytes),
+        bytes_to_mib(result.concurrent.memory.peak_allocator_free_bytes),
+        bytes_to_mib(result.concurrent.memory.peak_tracked_stage_bytes),
+        bytes_to_mib(result.concurrent.graph_cache_resident_bytes),
+        bytes_to_mib(result.concurrent.slatedb_cache_resident_bytes),
         result.rows,
         result.concurrent.rows,
         result.has_next,
@@ -1201,6 +1312,67 @@ fn current_rss_bytes() -> u64 {
     platform_current_rss_bytes().unwrap_or(0)
 }
 
+fn start_memory_sampler() -> (tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<MemoryPeaks>) {
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let interval_ms = env_u64("GRAPH_QUERY_BENCH_MEMORY_SAMPLE_MS", 10).max(1);
+    let task = tokio::spawn(async move {
+        let mut peaks = MemoryPeaks::default();
+        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            sample_memory(&mut peaks);
+            tokio::select! {
+                _ = interval.tick() => {}
+                changed = stopped.changed() => {
+                    sample_memory(&mut peaks);
+                    if changed.is_err() || *stopped.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        peaks
+    });
+    (stop, task)
+}
+
+fn sample_memory(peaks: &mut MemoryPeaks) {
+    let process = platform_process_memory();
+    peaks.peak_rss_bytes = peaks.peak_rss_bytes.max(process.rss_bytes);
+    peaks.peak_allocator_live_bytes = peaks.peak_allocator_live_bytes.max(process.allocator_live_bytes);
+    peaks.peak_allocator_free_bytes = peaks.peak_allocator_free_bytes.max(process.allocator_free_bytes);
+    let tracked = hydradb::memory_diagnostic_snapshot()
+        .into_iter()
+        .map(|stage| stage.estimated_bytes)
+        .fold(0_u64, u64::saturating_add);
+    peaks.peak_tracked_stage_bytes = peaks.peak_tracked_stage_bytes.max(tracked);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessMemorySample {
+    rss_bytes: u64,
+    allocator_live_bytes: u64,
+    allocator_free_bytes: u64,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn platform_process_memory() -> ProcessMemorySample {
+    let allocator = unsafe { libc::mallinfo2() };
+    ProcessMemorySample {
+        rss_bytes: current_rss_bytes(),
+        allocator_live_bytes: (allocator.uordblks as u64).saturating_add(allocator.hblkhd as u64),
+        allocator_free_bytes: allocator.fordblks as u64,
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn platform_process_memory() -> ProcessMemorySample {
+    ProcessMemorySample {
+        rss_bytes: current_rss_bytes(),
+        ..ProcessMemorySample::default()
+    }
+}
+
 fn trim_process_memory_for_profile() {
     if !std::env::var("GRAPH_TRIM_MEMORY_AFTER_HYDRATION")
         .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
@@ -1337,7 +1509,17 @@ struct ConcurrentStats {
     qps: f64,
     queries: u64,
     rows: usize,
+    memory: MemoryPeaks,
+    graph_cache_resident_bytes: u64,
+    slatedb_cache_resident_bytes: u64,
+}
+
+#[derive(Default)]
+struct MemoryPeaks {
     peak_rss_bytes: u64,
+    peak_allocator_live_bytes: u64,
+    peak_allocator_free_bytes: u64,
+    peak_tracked_stage_bytes: u64,
 }
 
 #[derive(Default)]

@@ -3,6 +3,7 @@ use crate::core::memory_diagnostics::{MemoryDiagnosticGuard, MemoryStage, Tracke
 use crate::{
     graph_now_millis, open_graph_db, open_graph_reader, GraphCacheConfig, GraphDurabilityConfig, GraphError, GraphIndexPolicy,
     GraphMemoryConfig, GraphOpenOptions, GraphOperationalMetrics, GraphStorageMemoryConfig, Result, SharedSlateDbCache,
+    SlateDbCacheMetricsSnapshot,
 };
 use hydradb_placement::cell_writer;
 use slatedb::bytes::Bytes;
@@ -648,6 +649,14 @@ impl SlateGraphStore {
 
     pub fn has_block_cache(&self) -> bool {
         self.inner.cache.slatedb_cache_bytes > 0
+    }
+
+    /// Process-wide SlateDB cache usage visible to this graph store.
+    ///
+    /// The cache is shared by stores opened over the same object-store handle,
+    /// so these bytes are intentionally not attributed to one cell or query.
+    pub fn slatedb_cache_metrics(&self) -> SlateDbCacheMetricsSnapshot {
+        self.inner.slatedb_cache.snapshot()
     }
 
     pub fn lazy(

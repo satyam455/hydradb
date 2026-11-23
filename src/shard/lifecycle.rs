@@ -7,6 +7,12 @@ use std::sync::OnceLock;
 use tracing::Instrument as _;
 
 impl GraphShard {
+    /// Process-wide SlateDB cache usage for the object-store handle backing
+    /// this shard. See [`SlateGraphStore::slatedb_cache_metrics`].
+    pub fn slatedb_cache_metrics(&self) -> SlateDbCacheMetricsSnapshot {
+        self.storage.slatedb_cache_metrics()
+    }
+
     pub async fn open(path: impl Into<Path>, object_store: Arc<dyn ObjectStore>) -> Result<Self> {
         Self::open_with_options(path, object_store, GraphOpenOptions::default()).await
     }
