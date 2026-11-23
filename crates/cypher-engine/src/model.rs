@@ -519,29 +519,34 @@ pub struct OrderedRelationshipPropertyScanPage {
     pub exhausted: bool,
 }
 
+/// A hydrated vertex. Labels and properties sit behind `Arc`s so the copies
+/// every expansion and binding row makes are pointer copies, not deep copies
+/// of every property name and value; a writer goes through
+/// [`std::sync::Arc::make_mut`], which copies only a shared map. Equality and
+/// hashing compare the contents, as before.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct VertexRecord {
     pub id: VertexId,
-    pub labels: BTreeSet<String>,
-    pub properties: BTreeMap<String, ScalarValue>,
+    pub labels: std::sync::Arc<BTreeSet<String>>,
+    pub properties: std::sync::Arc<BTreeMap<String, ScalarValue>>,
 }
 
 impl VertexRecord {
     pub fn new(id: VertexId) -> Self {
         Self {
             id,
-            labels: BTreeSet::new(),
-            properties: BTreeMap::new(),
+            labels: std::sync::Arc::default(),
+            properties: std::sync::Arc::default(),
         }
     }
 
     pub fn with_label(mut self, label: impl Into<String>) -> Self {
-        self.labels.insert(label.into());
+        std::sync::Arc::make_mut(&mut self.labels).insert(label.into());
         self
     }
 
     pub fn with_property(mut self, name: impl Into<String>, value: ScalarValue) -> Self {
-        self.properties.insert(name.into(), value);
+        std::sync::Arc::make_mut(&mut self.properties).insert(name.into(), value);
         self
     }
 }

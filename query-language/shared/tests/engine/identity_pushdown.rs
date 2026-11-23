@@ -197,7 +197,7 @@ async fn conjunctive_and_stacked_identity_equalities_preserve_invalid_value_erro
 #[tokio::test]
 async fn outer_invalid_identity_equality_does_not_cross_an_earlier_empty_filter() {
     let mut record = entity(1, "Entity", "one");
-    record.properties.insert("rank".to_string(), ScalarValue::Integer(1));
+    std::sync::Arc::make_mut(&mut record.properties).insert("rank".to_string(), ScalarValue::Integer(1));
     let engine = CypherEngine::new(MemoryStorage::with_vertices([record]));
     let prepared = engine
         .prepare(
@@ -479,9 +479,9 @@ async fn unsafe_conjunction_does_not_hide_eager_predicate_errors() {
 #[tokio::test]
 async fn identity_pushdown_does_not_cross_fallible_inner_filters_or_left_join_branches() {
     let mut entity_record = entity(1, "Entity", "one");
-    entity_record.properties.insert("rank".to_string(), ScalarValue::Integer(1));
+    std::sync::Arc::make_mut(&mut entity_record.properties).insert("rank".to_string(), ScalarValue::Integer(1));
     let mut other_record = entity(2, "Other", "two");
-    other_record.properties.insert("rank".to_string(), ScalarValue::Integer(1));
+    std::sync::Arc::make_mut(&mut other_record.properties).insert("rank".to_string(), ScalarValue::Integer(1));
     let engine = CypherEngine::new(MemoryStorage::with_vertices([entity_record, other_record]));
     for query in [
         "MATCH (e:Entity {rank: 1 / 0}) WHERE e.id IN [999] RETURN e",

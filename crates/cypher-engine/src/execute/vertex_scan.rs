@@ -643,8 +643,8 @@ async fn range_seek_rows(read: &mut dyn GraphRead, range: RangeSeek<'_>) -> Engi
                     .into_iter()
                     .map(|(id, value)| VertexRecord {
                         id,
-                        labels: range.labels.iter().map(ToString::to_string).collect(),
-                        properties: BTreeMap::from([(request.property.clone(), value)]),
+                        labels: std::sync::Arc::new(range.labels.iter().map(ToString::to_string).collect()),
+                        properties: std::sync::Arc::new(BTreeMap::from([(request.property.clone(), value)])),
                     })
                     .collect(),
                 last: page.last,
@@ -781,8 +781,8 @@ pub(super) async fn count_range_seek(read: &mut dyn GraphRead, count: &CountOnly
         binding.clone(),
         VertexRecord {
             id: 0,
-            labels: labels.iter().map(ToString::to_string).collect(),
-            properties: BTreeMap::new(),
+            labels: std::sync::Arc::new(labels.iter().map(ToString::to_string).collect()),
+            properties: std::sync::Arc::default(),
         },
     );
     let mut entries_read = 0_u64;
@@ -811,7 +811,7 @@ pub(super) async fn count_range_seek(read: &mut dyn GraphRead, count: &CountOnly
             }
             let vertex = row.vertices.get_mut(binding).expect("the counted binding is bound");
             vertex.id = id;
-            vertex.properties.insert(request.property.clone(), value);
+            std::sync::Arc::make_mut(&mut vertex.properties).insert(request.property.clone(), value);
             let holds = predicate_holds(
                 evaluate_expression(count.predicate, &row)?,
                 "Filter predicate did not evaluate to a boolean",

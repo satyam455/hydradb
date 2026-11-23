@@ -666,12 +666,14 @@ impl GraphRead for HydraDbCypherRead<'_> {
                         .into_iter()
                         .map(|(id, metadata)| EngineVertexRecord {
                             id,
-                            labels: metadata.labels,
-                            properties: metadata
-                                .properties
-                                .iter()
-                                .map(|(name, value)| (name.clone(), property_to_scalar(value)))
-                                .collect(),
+                            labels: Arc::new(metadata.labels),
+                            properties: Arc::new(
+                                metadata
+                                    .properties
+                                    .iter()
+                                    .map(|(name, value)| (name.clone(), property_to_scalar(value)))
+                                    .collect(),
+                            ),
                         })
                         .collect(),
                     // The walk already speaks property values, so unlike the
@@ -1316,12 +1318,14 @@ impl GraphRead for HydraDbCypherRead<'_> {
                 Ok(hydrated
                     .map(|(id, metadata)| EngineVertexRecord {
                         id,
-                        labels: metadata.labels,
-                        properties: metadata
-                            .properties
-                            .into_iter()
-                            .map(|(name, value)| (name, property_into_scalar(value)))
-                            .collect(),
+                        labels: Arc::new(metadata.labels),
+                        properties: Arc::new(
+                            metadata
+                                .properties
+                                .into_iter()
+                                .map(|(name, value)| (name, property_into_scalar(value)))
+                                .collect(),
+                        ),
                     })
                     .collect())
             },
@@ -2042,8 +2046,8 @@ fn engine_path_to_hydradb(path: hydradb_cypher_engine::PathValue) -> Result<crat
             .map(|node| {
                 Ok(QueryPathNode {
                     id: node.id,
-                    labels: node.labels.into_iter().collect(),
-                    properties: properties(node.properties)?,
+                    labels: Arc::unwrap_or_clone(node.labels).into_iter().collect(),
+                    properties: properties(Arc::unwrap_or_clone(node.properties))?,
                 })
             })
             .collect::<Result<Vec<_>>>()?,

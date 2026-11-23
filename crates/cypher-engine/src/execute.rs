@@ -6228,7 +6228,7 @@ fn stored_record_field(value: EvaluatedValue, field: &Symbol, row: &BindingRow) 
         EvaluatedValue::Vertex(id) => Ok(property(
             row_vertex_records(row)
                 .find(|record| record.id == id)
-                .map(|record| &record.properties),
+                .map(|record| &*record.properties),
         )),
         EvaluatedValue::Relationship(id) => Ok(property(
             row_relationship_records(row)
