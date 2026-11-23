@@ -251,6 +251,9 @@ pub fn decode_u64(key: &str, value: &[u8]) -> Result<u64> {
 }
 
 pub fn encode_vertex_metadata(metadata: &VertexMetadata) -> Vec<u8> {
+    if vertex_record_v2_enabled() {
+        return encode_vertex_metadata_v2(metadata);
+    }
     let mut value = String::from("vertex-metadata-v1\n");
     for label in &metadata.labels {
         value.push_str("label\t");
@@ -281,6 +284,9 @@ pub fn decode_vertex_metadata_projected(
     value: &[u8],
     keep: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<VertexMetadata> {
+    if value.starts_with(VERTEX_RECORD_V2_MAGIC) {
+        return decode_vertex_metadata_v2(key, value, keep);
+    }
     let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
         key: key.to_string(),
         reason: err.to_string(),
@@ -340,6 +346,223 @@ pub fn decode_vertex_metadata_projected(
         }
     }
     Ok(metadata)
+}
+
+/// Experimental, opt-in: a binary vertex record a reader can take one
+/// property from without scanning the rest.
+///
+/// ```text
+/// magic        4 bytes  "\0VM2" (a v1 record starts with 'v', so they never collide)
+/// labels       u16 count, then per label: u16 length + UTF-8 bytes
+/// properties   u32 count
+/// directory    u32 per property: offset of its entry within the entries area
+/// entries      per property, sorted by name: u16 name length, name, u32 value length, value
+/// ```
+///
+/// Values keep the v1 per-property encoding (`encode_vertex_property_value_record`),
+/// so only the framing changes. Names are sorted (the map is a `BTreeMap`),
+/// so a projected read binary-searches the directory per wanted name and
+/// never touches the other properties. Written only when
+/// `HYDRADB_VERTEX_RECORD_FORMAT=v2`; every reader accepts both formats.
+pub const VERTEX_RECORD_V2_MAGIC: &[u8] = b"\0VM2";
+
+fn vertex_record_v2_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("HYDRADB_VERTEX_RECORD_FORMAT").is_ok_and(|value| value.eq_ignore_ascii_case("v2")))
+}
+
+pub fn encode_vertex_metadata_v2(metadata: &VertexMetadata) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + metadata.properties.len() * 32);
+    out.extend_from_slice(VERTEX_RECORD_V2_MAGIC);
+    out.extend_from_slice(&(metadata.labels.len() as u16).to_le_bytes());
+    for label in &metadata.labels {
+        out.extend_from_slice(&(label.len() as u16).to_le_bytes());
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.extend_from_slice(&(metadata.properties.len() as u32).to_le_bytes());
+    let directory_at = out.len();
+    out.resize(directory_at + 4 * metadata.properties.len(), 0);
+    let entries_at = out.len();
+    for (index, (name, property)) in metadata.properties.iter().enumerate() {
+        let offset = (out.len() - entries_at) as u32;
+        out[directory_at + 4 * index..directory_at + 4 * index + 4].copy_from_slice(&offset.to_le_bytes());
+        let value = encode_vertex_property_value_record(property);
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    out
+}
+
+struct V2Reader<'a> {
+    key: &'a str,
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> V2Reader<'a> {
+    fn corrupt(&self, reason: &str) -> GraphError {
+        GraphError::CorruptValue {
+            key: self.key.to_string(),
+            reason: format!("vertex record v2: {reason}"),
+        }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .at
+            .checked_add(len)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| self.corrupt("truncated"))?;
+        let slice = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(slice)
+    }
+
+    fn u16(&mut self) -> Result<usize> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().expect("two bytes")) as usize)
+    }
+
+    fn u32(&mut self) -> Result<usize> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("four bytes")) as usize)
+    }
+
+    fn str(&mut self, len: usize) -> Result<&'a str> {
+        let bytes = self.take(len)?;
+        std::str::from_utf8(bytes).map_err(|_| self.corrupt("non-UTF-8 text"))
+    }
+}
+
+fn decode_vertex_metadata_v2(key: &str, value: &[u8], keep: Option<&std::collections::BTreeSet<String>>) -> Result<VertexMetadata> {
+    let mut reader = V2Reader {
+        key,
+        bytes: value,
+        at: VERTEX_RECORD_V2_MAGIC.len(),
+    };
+    let mut metadata = VertexMetadata::default();
+    for _ in 0..reader.u16()? {
+        let len = reader.u16()?;
+        let label = reader.str(len)?;
+        validate_component("label", label)?;
+        metadata.labels.insert(label.to_string());
+    }
+    let count = reader.u32()?;
+    let directory = reader.take(count.checked_mul(4).ok_or_else(|| reader.corrupt("property count overflows"))?)?;
+    let entries_at = reader.at;
+    let entry = |index: usize| -> Result<(&str, &str)> {
+        let offset = u32::from_le_bytes(directory[4 * index..4 * index + 4].try_into().expect("four bytes")) as usize;
+        let mut entry = V2Reader {
+            key,
+            bytes: value,
+            at: entries_at.checked_add(offset).ok_or_else(|| reader.corrupt("offset overflows"))?,
+        };
+        let name_len = entry.u16()?;
+        let name = entry.str(name_len)?;
+        let value_len = entry.u32()?;
+        Ok((name, entry.str(value_len)?))
+    };
+    let mut insert = |name: &str, encoded: &str| -> Result<()> {
+        validate_component("property", name)?;
+        metadata
+            .properties
+            .insert(name.to_string(), decode_vertex_property_value_record(key, encoded)?);
+        Ok(())
+    };
+    match keep {
+        None => {
+            for index in 0..count {
+                let (name, encoded) = entry(index)?;
+                insert(name, encoded)?;
+            }
+        }
+        Some(keep) => {
+            // Binary search per wanted name; the others are never read.
+            for wanted in keep {
+                let (mut low, mut high) = (0, count);
+                while low < high {
+                    let mid = low + (high - low) / 2;
+                    let (name, encoded) = entry(mid)?;
+                    match name.cmp(wanted.as_str()) {
+                        std::cmp::Ordering::Less => low = mid + 1,
+                        std::cmp::Ordering::Greater => high = mid,
+                        std::cmp::Ordering::Equal => {
+                            insert(name, encoded)?;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(metadata)
+}
+
+#[cfg(test)]
+mod vertex_record_v2_tests {
+    use super::*;
+
+    fn sample() -> VertexMetadata {
+        let mut metadata = VertexMetadata::default();
+        metadata.labels.insert("Entity".to_string());
+        metadata.labels.insert("Person".to_string());
+        metadata
+            .properties
+            .insert("name".to_string(), VertexPropertyValue::String("Ada".to_string()));
+        metadata.properties.insert("age".to_string(), VertexPropertyValue::Integer(36));
+        metadata
+            .properties
+            .insert("score".to_string(), VertexPropertyValue::Float(QueryFloat(1.5)));
+        metadata.properties.insert("debt".to_string(), VertexPropertyValue::from_i64(-7));
+        metadata.properties.insert("active".to_string(), VertexPropertyValue::Bool(true));
+        metadata
+    }
+
+    #[test]
+    fn v2_round_trips_every_property() {
+        let metadata = sample();
+        let bytes = encode_vertex_metadata_v2(&metadata);
+        assert!(bytes.starts_with(VERTEX_RECORD_V2_MAGIC));
+        assert_eq!(decode_vertex_metadata("k", &bytes).unwrap(), metadata);
+    }
+
+    #[test]
+    fn v2_projection_matches_v1_projection() {
+        let metadata = sample();
+        let v1 = {
+            let mut value = String::from("vertex-metadata-v1\n");
+            for label in &metadata.labels {
+                value.push_str(&format!("label\t{label}\n"));
+            }
+            for (name, property) in &metadata.properties {
+                value.push_str(&format!("property\t{name}\t{}\n", encode_vertex_property_value_record(property)));
+            }
+            value.into_bytes()
+        };
+        let v2 = encode_vertex_metadata_v2(&metadata);
+        for wanted in [vec![], vec!["age"], vec!["name", "missing"], vec!["active", "debt", "score"]] {
+            let keep = wanted
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                decode_vertex_metadata_projected("k", &v2, Some(&keep)).unwrap(),
+                decode_vertex_metadata_projected("k", &v1, Some(&keep)).unwrap(),
+                "{wanted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_rejects_truncation_instead_of_panicking() {
+        let bytes = encode_vertex_metadata_v2(&sample());
+        for len in VERTEX_RECORD_V2_MAGIC.len()..bytes.len() {
+            assert!(
+                decode_vertex_metadata("k", &bytes[..len]).is_err(),
+                "accepted a record cut at {len}"
+            );
+        }
+    }
 }
 
 pub fn encode_edge_metadata(metadata: &EdgeMetadata) -> Vec<u8> {
