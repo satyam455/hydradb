@@ -4834,6 +4834,9 @@ async fn variable_expand_rows(
         if frontier.is_empty() || max_hops.is_some_and(|max_hops| depth > u32::from(max_hops)) {
             break;
         }
+        // The final depth of a bounded walk: its states are never expanded.
+        // Quantified iterations keep the general path.
+        let last_hop = iteration.is_none() && max_hops.is_some_and(|max_hops| depth == u32::from(max_hops));
         let mut by_input = BTreeMap::<VertexId, Vec<(VertexId, RelationshipRecord)>>::new();
         let mut targets = BTreeMap::<VertexId, VertexRecord>::new();
         let mut candidate_rows = 0_usize;
@@ -4948,6 +4951,31 @@ async fn variable_expand_rows(
                         state.history.clone()
                     }
                     .extend(relationship, *target_id);
+                    // At the last hop no state is expanded again, so building
+                    // one (a full copy of the row) only to drop it is waste:
+                    // emit straight from the current state instead, and move
+                    // its row into the final candidate's output.
+                    if last_hop {
+                        if depth >= u32::from(min_hops)
+                            && target_labels.iter().all(|label| target.labels.contains(label.as_str()))
+                            && state.row.vertices.get(to).is_none_or(|existing| existing == target)
+                        {
+                            let mut row = if index + 1 == candidates.len() {
+                                std::mem::take(&mut state.row)
+                            } else {
+                                state.row.clone()
+                            };
+                            row.vertices.insert(to.clone(), target.clone());
+                            if bind_path(&mut row, path_binding, history.records()) && residuals_hold(&row, residuals)? {
+                                output.push(row);
+                                read.check_intermediate_rows("cypher_variable_expand_output_rows", output.len())?;
+                                if row_limit.is_some_and(|limit| output.len() >= limit) {
+                                    return Ok(output);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let next_state = TraversalState {
                         row: state.row.clone(),
                         start: state.start,
