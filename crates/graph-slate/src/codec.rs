@@ -268,6 +268,19 @@ pub fn encode_vertex_metadata(metadata: &VertexMetadata) -> Vec<u8> {
 }
 
 pub fn decode_vertex_metadata(key: &str, value: &[u8]) -> Result<VertexMetadata> {
+    decode_vertex_metadata_projected(key, value, None)
+}
+
+/// [`decode_vertex_metadata`] keeping only the properties named in `keep`
+/// (every property when `None`). Labels are always kept. A skipped property's
+/// value is never decoded or allocated, which is the point: a query that reads
+/// two properties of a 2,000-property vertex should not materialize the other
+/// 1,998. Used by projection-aware hydration.
+pub fn decode_vertex_metadata_projected(
+    key: &str,
+    value: &[u8],
+    keep: Option<&std::collections::BTreeSet<String>>,
+) -> Result<VertexMetadata> {
     let text = std::str::from_utf8(value).map_err(|err| GraphError::CorruptValue {
         key: key.to_string(),
         reason: err.to_string(),
@@ -291,6 +304,18 @@ pub fn decode_vertex_metadata(key: &str, value: &[u8]) -> Result<VertexMetadata>
 
     let mut metadata = VertexMetadata::default();
     for line in lines {
+        // A skipped property is recognised from its name alone: no split into
+        // a Vec, no validation of a value nobody reads, no allocation. The
+        // name sits between the first and second tab of a property line.
+        if let Some(keep) = keep {
+            if let Some(rest) = line.strip_prefix("property\t") {
+                if let Some((name, _)) = rest.split_once('\t') {
+                    if !keep.contains(name) {
+                        continue;
+                    }
+                }
+            }
+        }
         let parts: Vec<_> = line.split('\t').collect();
         match parts.as_slice() {
             ["label", label] => {
@@ -298,6 +323,9 @@ pub fn decode_vertex_metadata(key: &str, value: &[u8]) -> Result<VertexMetadata>
                 metadata.labels.insert((*label).to_string());
             }
             ["property", name, encoded] => {
+                if keep.is_some_and(|keep| !keep.contains(*name)) {
+                    continue;
+                }
                 validate_component("property", name)?;
                 metadata
                     .properties

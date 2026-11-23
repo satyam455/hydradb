@@ -34,7 +34,6 @@ impl StorageNeighborScanBudget<'_> {
 // covers both users.
 #[cfg(feature = "opencypher")]
 pub(super) const QUERY_METADATA_HYDRATION_CONCURRENCY: usize = 16;
-
 /// Smallest batch of candidate records a bounded, unanchored node scan reads
 /// at once. A `LIMIT` smaller than this still reads one batch, so a selective
 /// `WHERE` costs a few batched reads rather than a round trip per candidate.
@@ -5247,7 +5246,7 @@ impl GraphShard {
         _read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<Option<VertexMetadata>> {
-        self.read_existing_vertex(cell_id, vertex_id, budget, true).await
+        self.read_existing_vertex(cell_id, vertex_id, budget, true, None).await
     }
 
     #[cfg(feature = "opencypher")]
@@ -5257,6 +5256,7 @@ impl GraphShard {
         vertex_id: VertexId,
         budget: &QueryBudget,
         has_overlays: bool,
+        keep: Option<&BTreeSet<String>>,
     ) -> Result<Option<VertexMetadata>> {
         validate_component("cell_id", cell_id)?;
         let key = keys::vertex(cell_id, vertex_id);
@@ -5265,7 +5265,7 @@ impl GraphShard {
                 .read_only_io("cypher_vertex_metadata", async {
                     self.read_remote(&key)
                         .await?
-                        .map(|bytes| decode_vertex_metadata(&key, &bytes))
+                        .map(|bytes| hydradb_graph_slate::decode_vertex_metadata_projected(&key, &bytes, keep))
                         .transpose()
                 })
                 .await?;
@@ -5292,10 +5292,12 @@ impl GraphShard {
                     None => return Ok(None),
                 },
             };
-            let mut metadata = decode_vertex_metadata(&key, &value)?;
+            let mut metadata = hydradb_graph_slate::decode_vertex_metadata_projected(&key, &value, keep)?;
             let overlay = overlay?;
             self.refuse_pending_record_properties(cell_id, &metadata, budget).await?;
-            metadata.properties.extend(overlay);
+            metadata
+                .properties
+                .extend(overlay.into_iter().filter(|(name, _)| keep.is_none_or(|keep| keep.contains(name))));
             Ok(Some(metadata))
         };
         budget.read_only_io("cypher_vertex_metadata", read).await
@@ -5312,7 +5314,7 @@ impl GraphShard {
         _read_epoch: StorageSequence,
         budget: &QueryBudget,
     ) -> Result<impl Iterator<Item = (VertexId, VertexMetadata)>> {
-        self.read_existing_vertices(cell_id, vertex_ids, budget, true).await
+        self.read_existing_vertices(cell_id, vertex_ids, budget, true, None).await
     }
 
     #[cfg(feature = "opencypher")]
@@ -5322,12 +5324,13 @@ impl GraphShard {
         vertex_ids: &[VertexId],
         budget: &QueryBudget,
         has_overlays: bool,
+        keep: Option<&BTreeSet<String>>,
     ) -> Result<impl Iterator<Item = (VertexId, VertexMetadata)>> {
         let records = stream::iter(vertex_ids.iter().copied().map(|vertex_id| async move {
             budget.check("cypher_metadata_hydration")?;
             let started = Instant::now();
             let metadata = self
-                .read_existing_vertex(cell_id, vertex_id, budget, has_overlays)
+                .read_existing_vertex(cell_id, vertex_id, budget, has_overlays, keep)
                 .instrument(tracing::info_span!(
                     "query.property_fetch",
                     hydradb.cell_id = %cell_id,

@@ -67,6 +67,55 @@ pub struct PreparedVertexScan {
 }
 
 impl PreparedVertexScan {
+    /// For `plan::demand`: every expression this scan
+    /// evaluates against a hydrated record and every property its access
+    /// path filters on, including those of guarded and range fallbacks.
+    pub(crate) fn visit_property_reads<'a>(&'a self, expressions: &mut Vec<&'a PhysicalExpression>, properties: &mut Vec<&'a Symbol>) {
+        // Exhaustive destructuring: a field added to the request or the scan
+        // properties stops this from compiling until it is classified here,
+        // so a new way of reading a record cannot be missed silently.
+        let VertexScanRequest {
+            binding: _,
+            labels: _,
+            predicates,
+            output: _,
+            window,
+        } = &self.request;
+        let VertexScanProperties {
+            estimated_rows: _,
+            ordering,
+            residual_predicates,
+            window_accepted: _,
+            may_scan_inventory: _,
+        } = &self.properties;
+        expressions.extend(predicates.iter());
+        if let Some(VertexWindow { ordering, required: _ }) = window {
+            expressions.extend(ordering.iter().map(|sort| &sort.expression));
+        }
+        expressions.extend(residual_predicates.iter());
+        expressions.extend(ordering.iter().map(|sort| &sort.expression));
+        match &self.plan {
+            VertexAccess::IdPoint { .. } | VertexAccess::IdPoints { .. } | VertexAccess::LabelPrefix { .. } | VertexAccess::AllVertices => {
+            }
+            VertexAccess::PropertyPoints { property, .. } | VertexAccess::PropertyPresence { property } => properties.push(property),
+            VertexAccess::OrderedProperty(ordered) => {
+                properties.push(&ordered.property);
+                expressions.extend(ordered.items.iter().map(|sort| &sort.expression));
+                expressions.extend(ordered.residual.iter());
+            }
+            VertexAccess::Guarded { access, fallback, .. } => {
+                if let GuardedAccess::PropertySeek { property, .. } = access {
+                    properties.push(property);
+                }
+                fallback.visit_property_reads(expressions, properties);
+            }
+            VertexAccess::Range { property, fallback, .. } => {
+                properties.push(property);
+                fallback.visit_property_reads(expressions, properties);
+            }
+        }
+    }
+
     fn new(request: VertexScanRequest, plan: VertexAccess, statistics: &dyn StatisticsProvider) -> Self {
         let estimated_rows = match &plan {
             VertexAccess::IdPoint { .. } => Some(1),

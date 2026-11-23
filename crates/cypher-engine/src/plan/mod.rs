@@ -1,4 +1,5 @@
 pub(crate) mod access;
+mod demand;
 mod error;
 mod estimate;
 pub(crate) mod explain;
@@ -13,6 +14,7 @@ mod statistics;
 mod value;
 mod value_type;
 
+pub(crate) use demand::vertex_property_demand;
 pub use error::{GraphPlanError, GraphPlanResult};
 pub use estimate::estimate_operator_rows;
 pub use explain::{explain_physical_plan, explain_physical_plan_shape};

@@ -25,6 +25,9 @@ use crate::shard::query::{IndexedRelationshipBatch, IndexedRelationshipPairMemo}
 mod observability;
 mod ordered_relationship_walk;
 mod ordered_walk;
+#[cfg(test)]
+#[path = "experimental_cypher/projected_hydration_tests.rs"]
+mod projected_hydration_tests;
 mod scope_statistics;
 
 use observability::{PlanIdentity, RequestObservation};
@@ -371,6 +374,7 @@ impl GraphStorage for HydraDbCypherStorage<'_> {
             completion_conditions: Vec::new(),
             write_back_present: Arc::default(),
             forked: false,
+            vertex_property_demand: None,
         }))
     }
 }
@@ -443,10 +447,17 @@ struct HydraDbCypherRead<'a> {
     /// GQL completion conditions the engine raised on this read, such as a
     /// null eliminated by an aggregate.
     completion_conditions: Vec<hydradb_cypher_engine::GqlStatus>,
+    /// The vertex properties the plan can read, or
+    /// `None` for whole records. See `GraphRead::set_vertex_property_demand`.
+    vertex_property_demand: Option<Arc<std::collections::BTreeSet<String>>>,
 }
 
 #[async_trait]
 impl GraphRead for HydraDbCypherRead<'_> {
+    fn set_vertex_property_demand(&mut self, demand: Option<Arc<std::collections::BTreeSet<String>>>) {
+        self.vertex_property_demand = demand;
+    }
+
     async fn scan_vertex_storage(&mut self, request: &VertexStorageScanRequest) -> StorageResult<VertexStorageScanPage> {
         match request {
             VertexStorageScanRequest::IdPoints { ids } => {
@@ -496,6 +507,7 @@ impl GraphRead for HydraDbCypherRead<'_> {
             completion_conditions: Vec::new(),
             write_back_present: Arc::clone(&self.write_back_present),
             forked: true,
+            vertex_property_demand: self.vertex_property_demand.clone(),
         }))
     }
 
@@ -1290,7 +1302,13 @@ impl GraphRead for HydraDbCypherRead<'_> {
                             self.write_back_present.get().copied().unwrap_or(true)
                         };
                         self.shard
-                            .read_existing_vertices(self.cell_id, vertex_ids, &self.budget, has_overlays)
+                            .read_existing_vertices(
+                                self.cell_id,
+                                vertex_ids,
+                                &self.budget,
+                                has_overlays,
+                                self.vertex_property_demand.as_deref(),
+                            )
                             .await
                     })
                     .await,

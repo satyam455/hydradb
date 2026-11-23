@@ -432,6 +432,10 @@ impl<S: GraphStorage> CypherEngine<S> {
     pub async fn execute_prepared_with_status(&self, prepared: &PreparedQuery) -> EngineResult<ExecutionOutcome> {
         prepared.capability().into_result()?;
         let mut read = self.storage.begin_read(ReadRequest::default()).await?;
+        // Hydrate only the properties the plan can read (see `plan::demand`).
+        if let Some(demand) = crate::plan::vertex_property_demand(&prepared.physical) {
+            read.set_vertex_property_demand(Some(std::sync::Arc::new(demand)));
+        }
         // Only a plan that can reach the same vertex twice is wrapped: the map
         // is a cost on every other shape and a saving on none of them.
         if plan_reuses_hydration(&prepared.physical) {

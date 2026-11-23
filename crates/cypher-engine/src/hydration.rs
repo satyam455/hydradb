@@ -248,6 +248,10 @@ impl<'a> HydrationIdentityMap<'a> {
 
 #[async_trait]
 impl GraphRead for HydrationIdentityMap<'_> {
+    fn set_vertex_property_demand(&mut self, demand: Option<std::sync::Arc<BTreeSet<String>>>) {
+        self.inner.set_vertex_property_demand(demand);
+    }
+
     fn checkpoint(&self, operation: &'static str) -> StorageResult<()> {
         self.inner.checkpoint(operation)
     }
