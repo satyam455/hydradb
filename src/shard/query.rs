@@ -34,6 +34,52 @@ impl StorageNeighborScanBudget<'_> {
 // covers both users.
 #[cfg(feature = "opencypher")]
 pub(super) const QUERY_METADATA_HYDRATION_CONCURRENCY: usize = 16;
+/// Hydration batches at least this large may be read with one range scan.
+#[cfg(feature = "opencypher")]
+const QUERY_VERTEX_RANGE_SCAN_MIN_IDS: usize = 32;
+/// ...when the id span is at most this many times the number of ids, so the
+/// scan reads no more than this many records per vertex wanted.
+#[cfg(feature = "opencypher")]
+const QUERY_VERTEX_RANGE_SCAN_MAX_SPAN_FACTOR: u64 = 2;
+/// Widest id span one range scan covers. SlateDB admits a scan's blocks to
+/// the block cache only when it expects at most 1,024 items
+/// (`remote_scan_options_for_expected_items`), while a point read always
+/// admits them; a wider batch is cut into ranges of this span so it warms the
+/// cache exactly as the per-vertex reads it replaces did.
+#[cfg(feature = "opencypher")]
+const QUERY_VERTEX_RANGE_SCAN_MAX_SPAN: u64 = 1_024;
+
+/// `vertex_ids` sorted and deduplicated when they are dense enough for one
+/// ordered range scan to beat a point read per vertex; `None` otherwise.
+#[cfg(feature = "opencypher")]
+fn dense_vertex_batch(vertex_ids: &[VertexId]) -> Option<Vec<VertexId>> {
+    if vertex_ids.len() < QUERY_VERTEX_RANGE_SCAN_MIN_IDS {
+        return None;
+    }
+    let mut sorted = vertex_ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let (first, last) = (*sorted.first()?, *sorted.last()?);
+    let span = last.checked_sub(first)?.checked_add(1)?;
+    (sorted.len() >= QUERY_VERTEX_RANGE_SCAN_MIN_IDS
+        && span <= (sorted.len() as u64).saturating_mul(QUERY_VERTEX_RANGE_SCAN_MAX_SPAN_FACTOR))
+    .then_some(sorted)
+}
+
+/// Options for a dense vertex range: blocks admitted to the cache like the
+/// point reads it replaces, and fetched ahead in large concurrent requests.
+/// SlateDB otherwise fetches one block per request, so on object storage a
+/// range of wide vertices is one round trip per block in sequence -- measured
+/// 6.6x slower cold than 16 concurrent point reads at 20 ms per request (the
+/// cost `BULK_SCAN_READ_AHEAD_BYTES` documents for bulk scans).
+#[cfg(feature = "opencypher")]
+fn vertex_range_scan_options(span: u64) -> slatedb::config::ScanOptions {
+    let mut options = remote_scan_options_for_expected_items(span);
+    options.read_ahead_bytes = hydradb_graph_slate::BULK_SCAN_READ_AHEAD_BYTES;
+    options.max_fetch_tasks = hydradb_graph_slate::BULK_SCAN_FETCH_TASKS;
+    options
+}
+
 /// Smallest batch of candidate records a bounded, unanchored node scan reads
 /// at once. A `LIMIT` smaller than this still reads one batch, so a selective
 /// `WHERE` costs a few batched reads rather than a round trip per candidate.
@@ -5326,6 +5372,16 @@ impl GraphShard {
         has_overlays: bool,
         keep: Option<&BTreeSet<String>>,
     ) -> Result<impl Iterator<Item = (VertexId, VertexMetadata)>> {
+        // A dense batch with no write-back overlays is one ordered range scan
+        // rather than one point read per vertex.
+        if !has_overlays {
+            if let Some(sorted) = dense_vertex_batch(vertex_ids) {
+                return Ok(self
+                    .read_existing_vertices_by_range(cell_id, &sorted, budget, keep)
+                    .await?
+                    .into_iter());
+            }
+        }
         let records = stream::iter(vertex_ids.iter().copied().map(|vertex_id| async move {
             budget.check("cypher_metadata_hydration")?;
             let started = Instant::now();
@@ -5344,7 +5400,101 @@ impl GraphShard {
         .boxed()
         .try_collect::<Vec<_>>()
         .await?;
-        Ok(records.into_iter().flatten())
+        Ok(records.into_iter().flatten().collect::<Vec<_>>().into_iter())
+    }
+
+    /// The vertices among `sorted_ids` (ascending, distinct) read with ordered
+    /// scans of the cell's vertex records, each over at most
+    /// [`QUERY_VERTEX_RANGE_SCAN_MAX_SPAN`] ids. Vertex keys are zero-padded,
+    /// so key order is id order and a scan visits at most its span of
+    /// records; [`dense_vertex_batch`]
+    /// only admits batches where that span is a small multiple of the ids
+    /// wanted. Only for cells without write-back overlays: an overlay is a
+    /// second read per vertex, which this path does not make. Results are in
+    /// id order; callers match by id.
+    #[cfg(feature = "opencypher")]
+    async fn read_existing_vertices_by_range(
+        &self,
+        cell_id: &str,
+        sorted_ids: &[VertexId],
+        budget: &QueryBudget,
+        keep: Option<&BTreeSet<String>>,
+    ) -> Result<Vec<(VertexId, VertexMetadata)>> {
+        validate_component("cell_id", cell_id)?;
+        let started = Instant::now();
+        let prefix = keys::vertex_prefix(cell_id);
+        let mut records = Vec::with_capacity(sorted_ids.len());
+        // Each range spans at most the cap, measured from its own first id.
+        let mut rest = sorted_ids;
+        while let Some(&first) = rest.first() {
+            let take = rest.partition_point(|id| id - first < QUERY_VERTEX_RANGE_SCAN_MAX_SPAN);
+            let (range, tail) = rest.split_at(take);
+            rest = tail;
+            records.extend(self.scan_vertex_range(&prefix, range, budget, keep).await?);
+        }
+        for (_, metadata) in &records {
+            self.refuse_pending_record_properties(cell_id, metadata, budget).await?;
+        }
+        self.operation_metrics.record_property_fetch(started.elapsed().as_micros() as u64);
+        Ok(records)
+    }
+
+    /// One bounded, ordered scan of the vertex records from `range[0]` to its
+    /// last id, keeping those in `range` (ascending, distinct).
+    #[cfg(feature = "opencypher")]
+    async fn scan_vertex_range(
+        &self,
+        prefix: &str,
+        range: &[VertexId],
+        budget: &QueryBudget,
+        keep: Option<&BTreeSet<String>>,
+    ) -> Result<Vec<(VertexId, VertexMetadata)>> {
+        let (Some(&first), Some(&last)) = (range.first(), range.last()) else {
+            return Ok(Vec::new());
+        };
+        let span = last - first + 1;
+        budget
+            .read_only_io("cypher_vertex_metadata", async {
+                let mut iter = self
+                    .storage
+                    .scan_prefix_range_with_options(
+                        prefix.as_bytes(),
+                        Some(format!("{first:020}").into_bytes()),
+                        last.checked_add(1).map(|end| format!("{end:020}").into_bytes()),
+                        &vertex_range_scan_options(span),
+                    )
+                    .await?;
+                let mut records = Vec::with_capacity(range.len());
+                let mut visited = 0_usize;
+                while let Some(kv) = iter.next().await? {
+                    visited += 1;
+                    if visited.is_multiple_of(256) {
+                        budget.check("cypher_metadata_hydration")?;
+                    }
+                    let key = std::str::from_utf8(&kv.key).map_err(|err| GraphError::CorruptValue {
+                        key: String::from_utf8_lossy(&kv.key).into_owned(),
+                        reason: err.to_string(),
+                    })?;
+                    let Some(vertex_id) = key.strip_prefix(prefix).and_then(|suffix| suffix.parse::<VertexId>().ok()) else {
+                        return Err(GraphError::CorruptValue {
+                            key: key.to_string(),
+                            reason: "expected a vertex record key".to_string(),
+                        });
+                    };
+                    if vertex_id > last {
+                        break;
+                    }
+                    if range.binary_search(&vertex_id).is_err() {
+                        continue;
+                    }
+                    records.push((
+                        vertex_id,
+                        hydradb_graph_slate::decode_vertex_metadata_projected(key, &kv.value, keep)?,
+                    ));
+                }
+                Ok(records)
+            })
+            .await
     }
 
     #[cfg(feature = "opencypher")]
